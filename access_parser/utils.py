@@ -4,6 +4,8 @@ import struct
 import uuid
 import math
 from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import List
 
 LOGGER = logging.getLogger("access_parser.utils")
 
@@ -56,10 +58,7 @@ FORMAT_TO_DEFAULT_VALUE = {
 }
 
 # Character Encodings for Different Jet Versions
-ENCODING_MAP = {
-    3: "cp1252",  # Jet 3.x (Access 97 and earlier)
-    4: "utf-16-le" # Jet 4.x+ (Access 2000 and newer)
-}
+
 TEXT_COMPRESSION_HEADER = b'\xff\xfe'
 
 # https://stackoverflow.com/questions/45560782
@@ -164,7 +163,7 @@ def decodeUncompressedText(textBytes: bytes, dataStart: int, dataEnd: int, versi
                    decoding errors are logged and replacement characters are used.
     :return: Decoded text string.
     """
-    encoding = ENCODING_MAP.get(version, "utf-16-le")  # Default to utf-16-le for unknown versions
+    encoding = version.CHARSET
     bytesToDecode = textBytes[dataStart:dataEnd]
     
     try:
