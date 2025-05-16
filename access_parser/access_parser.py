@@ -8,7 +8,7 @@ from tabulate import tabulate
 from .parsing_primitives import parse_relative_object_metadata_struct, parse_table_head, parse_data_page_header, \
     ACCESSHEADER, MEMO, parse_table_data, TDEF_HEADER, LVPROP, parse_buffer_custom
 from .utils import categorize_pages, parse_type, TYPE_MEMO, TYPE_TEXT, TYPE_BOOLEAN, read_db_file, numeric_to_string, \
-    TYPE_96_BIT_17_BYTES, TYPE_OLE, SimpleVarLenMetadata
+    TYPE_96_BIT_17_BYTES, TYPE_OLE
 from .jetformat import BaseFormat, Jet3Format, PageTypes
 
 # Page sizes
@@ -226,247 +226,64 @@ class AccessTable(object):
             parsed_table[column.col_name_str] = [] #changed to blank array to align to expected type if data was present.
         return parsed_table
 
+    def _clean_loc(self, x: int) -> int:
+        """
+        Strip off the high-bit flags (0x8000 = deleted, 0x4000 = overflow)
+        to get the true 12-bit page offset.
+        """
+        return x & 0x0FFF
+
+
     def parse(self):
         """
-        This is the main table parsing function. We go through all of the data pages linked to the table, separate each
-        data page to rows(records) and parse each record.
-        :return defaultdict(list) with the parsed data -- table[column][row_index]
+        Main table parsing function. Iterates data pages, splits into rows, and streams parsed rows.
+        :return: OrderedDict of parsed columns
         """
         if not self.table.owned_pages:
             return self.create_empty_table()
-        for data_chunk in self.table.owned_pages:
-            original_data = data_chunk
-            parsed_data = parse_data_page_header(original_data, version=self.version)
 
-            last_offset = None
-            for rec_offset in parsed_data.record_offsets:
-                # Deleted row - Just skip it
-                if rec_offset & 0x8000:
-                    last_offset = rec_offset & 0xfff
+        for page_data in self.table.owned_pages:
+            parsed_page = parse_data_page_header(page_data, version=self.version)
+            # iterate each slot entry
+            for row_num, raw_loc in enumerate(parsed_page.record_offsets):
+                # skip deleted rows
+                if raw_loc & 0x8000:
                     continue
-                # Overflow page
-                if rec_offset & 0x4000:
-                    # overflow ptr is 4 bits flags, 12 bits ptr
-                    rec_ptr_offset = rec_offset & 0xfff
-                    # update last pointer to pointer without flags
-                    last_offset = rec_ptr_offset
-                    # The ptr is the offset in the current data page. we get a 4 byte record_pointer from that
-                    overflow_rec_ptr = original_data[rec_ptr_offset:rec_ptr_offset + 4]
-                    overflow_rec_ptr = struct.unpack("<I", overflow_rec_ptr)[0]
-                    record = self._get_overflow_record(overflow_rec_ptr)
-                    if record:
-                        self._parse_row(record)
+
+                # overflow row
+                if raw_loc & 0x4000:
+                    start = self._clean_loc(raw_loc)
+                    # read 4-byte overflow pointer
+                    ptr = struct.unpack_from('<I', page_data, start)[0]
+                    overflow_record = self._get_overflow_record(ptr)
+                    if overflow_record is not None:
+                        self._parse_row(overflow_record)
                     continue
-                # First record is actually the last one - from offset until the end of the data
-                if not last_offset:
-                    record = original_data[rec_offset:]
+
+                # normal row: compute cleaned start/end
+                start = self._clean_loc(raw_loc)
+                if row_num == 0:
+                    end = self.page_size
                 else:
-                    record = original_data[rec_offset:last_offset]
-                last_offset = rec_offset
+                    end = self._clean_loc(parsed_page.record_offsets[row_num - 1])
+
+                record = page_data[start:end]
                 if record:
                     self._parse_row(record)
-                
-        if len(self.parsed_table) == 0: ##All records deleted
+
+        # if all rows deleted
+        if not self.parsed_table:
             return self.create_empty_table()
-        
-        ## fix final output order
-        columns_sorted = OrderedDict(sorted(self.columns.items()))
-        reordered_parsed_table = OrderedDict([(column.col_name_str,self.parsed_table[column.col_name_str]) for i, column in columns_sorted.items()])
-        self.parsed_table = reordered_parsed_table
+
+        # reorder columns in output
+        columns_sorted = OrderedDict(sorted(self.columns.items(), key=lambda t: t[0]))
+        reordered = OrderedDict(
+            (col.col_name_str, self.parsed_table[col.col_name_str])
+            for _, col in columns_sorted.items()
+        )
+        self.parsed_table = reordered
         return self.parsed_table
 
-    def _parse_row(self, record):
-        """
-        parse record (row) of data. First parse all fixed-length data field and then parse the relative length data.
-        :param record: the current row data
-        :return:
-        """
-        original_record = record
-        reverse_record = record[::-1]
-
-        if self.version > 3:
-            field_count = struct.unpack_from("h", record)[0]
-            record = record[2:]
-        else:
-            field_count = struct.unpack_from("b", record)[0]
-            record = record[1:]
-        # Records contain null bitmaps for columns. The number of bitmaps is the number of columns / 8 rounded up
-
-        null_table_len = (field_count + 7) // 8
-        if null_table_len and null_table_len < len(original_record):
-            null_table = record[-null_table_len:]
-            # Turn bitmap to a list of True False values
-            null_table = [((null_table[i // 8]) & (1 << (i % 8))) != 0 for i in range(len(null_table) * 8)]
-        else:
-            LOGGER.error(f"Failed to parse null table column count {field_count}")
-            return
-
-        relative_records_column_map = {}
-        # Iterate columns
-        for i, column in self.columns.items():
-            # Fixed length columns are handled before variable length. If this is a variable length column add it to
-            # mapping and continue
-            if not column.column_flags.fixed_length:
-                relative_records_column_map[i] = column
-                continue
-
-            self._parse_fixed_length_data(record, column, null_table)
-        if relative_records_column_map:
-            relative_records_column_map = dict(sorted(relative_records_column_map.items()))
-            metadata = self._parse_dynamic_length_records_metadata(reverse_record, original_record,
-                                                                   null_table_len)
-            if not metadata:
-                return
-            if metadata.variable_length_field_offsets:
-                self._parse_dynamic_length_data(original_record, metadata, relative_records_column_map, null_table)
-
-    def _parse_fixed_length_data(self, original_record, column, null_table):
-        """
-        Parse fixed-length data from record
-        :param original_record: unmodified record
-        :param column: column this data belongs to
-        :param null_table: null table of the row
-        """
-        column_name = column.col_name_str
-        # The null table indicates null values in the row.
-        # The only exception is BOOL fields which are encoded in the null table
-        has_value = True
-        if column.column_id > len(null_table):
-            #new column added after row creation, not covered by null mask, in this case has_value = false
-            has_value = False
-            if column.type == TYPE_BOOLEAN:
-                has_value = None
-        else:
-            has_value = null_table[column.column_id]
-        # Boolean fields are encoded in the null table
-        if column.type == TYPE_BOOLEAN:
-            parsed_type = has_value
-        else:
-            if column.fixed_offset > len(original_record):
-                LOGGER.error(f"Column offset is bigger than the length of the record {column.fixed_offset}")
-                return
-            record = original_record[column.fixed_offset:]
-            parsed_type = parse_type(column.type, record, version=self.version, props=column.extra_props or None)
-            if not has_value:
-                self.parsed_table[column_name].append(None)
-                return
-        self.parsed_table[column_name].append(parsed_type)
-
-    def _parse_dynamic_length_records_metadata(self, reverse_record, original_record, null_table_length):
-        """
-        parse the metadata of relative records. The metadata used to parse relative records is found at the end of the
-        record so reverse_record is used for parsing from the bottom up.
-        :param reverse_record: original record in reverse
-        :param original_record: unmodified record
-        :param null_table_length:
-        :return: parsed relative record metadata
-        """
-        if self.version > 3:
-            reverse_record = reverse_record[null_table_length:]
-            return parse_relative_object_metadata_struct(reverse_record, version=self.version)
-        # Parse relative metadata.
-        # Metadata is from the end of the record(reverse_record is used here)
-        variable_length_jump_table_cnt = (len(original_record) - 1) // 256
-        reverse_record = reverse_record[null_table_length:]
-        try:
-            relative_record_metadata = parse_relative_object_metadata_struct(reverse_record,
-                                                                             variable_length_jump_table_cnt,
-                                                                             self.version)
-            # relative_record_metadata = RELATIVE_OBJS.parse(reverse_record)
-            # we use this offset in original_record so we have to update the length with the null_tables
-            relative_record_metadata.relative_metadata_end = relative_record_metadata.relative_metadata_end + null_table_length
-        except ConstructError:
-            relative_record_metadata = None
-            LOGGER.error("Failed parsing record")
-
-        if relative_record_metadata and \
-                relative_record_metadata.variable_length_field_count != self.table_header.variable_columns:
-
-            # best effort - try to find variable column count in the record and parse from there
-            # this is limited to the 10 first bytes to reduce false positives.
-            # most of the time iv'e seen this there was an extra DWORD before the actual metadata
-            metadata_start = reverse_record.find(bytes([self.table_header.variable_columns]))
-            if metadata_start != -1 and metadata_start < 10:
-                reverse_record = reverse_record[metadata_start:]
-                try:
-                    relative_record_metadata = parse_relative_object_metadata_struct(reverse_record,
-                                                                                     variable_length_jump_table_cnt,
-                                                                                     self.version)
-                except ConstructError:
-                    LOGGER.error(f"Failed to parse record metadata: {original_record}")
-                relative_record_metadata.relative_metadata_end = relative_record_metadata.relative_metadata_end + \
-                                                                 metadata_start
-            else:
-                LOGGER.warning(
-                    f"Record did not parse correctly. Number of columns: {self.table_header.variable_columns}"
-                    f" number of parsed columns: {relative_record_metadata.variable_length_field_count}")
-                return None
-        return relative_record_metadata
-
-    def _parse_dynamic_length_data(self, original_record, relative_record_metadata,
-                                   relative_records_column_map, null_table):
-        """
-        Parse dynamic (non fixed length) records from row
-        :param original_record: full unmodified record
-        :param relative_record_metadata: parsed record metadata
-        :param relative_records_column_map: relative records colum mapping {index: column}
-        :param null_table: list indicating which columns have null value
-        """
-        relative_offsets = relative_record_metadata.variable_length_field_offsets
-        jump_table_addition = 0
-        for i, column_index in enumerate(relative_records_column_map):
-            column = relative_records_column_map[column_index]
-            col_name = column.col_name_str
-            has_value = True
-            if column.column_id > len(null_table):
-                #New column with no data so map to false
-                has_value = False
-            else:
-                has_value = null_table[column.column_id]
-            if not has_value:
-                self.parsed_table[col_name].append(None)
-                continue
-
-            if self.version == 3:
-                if column.variable_column_number in relative_record_metadata.variable_length_jump_table:
-                    jump_table_addition += 0x100
-            rel_start = relative_offsets[column.variable_column_number]
-            # If this is the last one use var_len_count as end offset
-            if column.variable_column_number + 1 == len(relative_offsets):
-                rel_end = relative_record_metadata.var_len_count
-            else:
-                rel_end = relative_offsets[column.variable_column_number + 1]
-
-            # if rel_start and rel_end are the same there is no data in this slot
-            if rel_start == rel_end:
-                self.parsed_table[col_name].append("")
-                continue
-
-            relative_obj_data = original_record[rel_start + jump_table_addition: rel_end + jump_table_addition]
-            # Parse types that require column data here, call parse_type on all other types
-            if column.type == TYPE_MEMO:
-                try:
-                    parsed_type = self._parse_memo(relative_obj_data)
-                except ConstructError:
-                    LOGGER.warning("Failed to parse memo field. Using data as bytes")
-                    parsed_type = relative_obj_data
-            elif column.type == TYPE_OLE:
-                try:
-                    parsed_type = self._parse_memo(relative_obj_data, return_raw=True)
-                except ConstructError:
-                    LOGGER.warning("Failed to parse OLE field. Using data as bytes")
-                    parsed_type = relative_obj_data
-            elif column.type == TYPE_96_BIT_17_BYTES:
-                if len(relative_obj_data) != 17:
-                    LOGGER.warning(f"Relative numeric field has invalid length {len(relative_obj_data)}, expected 17")
-                    parsed_type = relative_obj_data
-                else:
-                    # Get scale or None
-                    scale = column.get('various', {}).get('scale', 6)
-                    parsed_type = numeric_to_string(relative_obj_data, scale)
-            else:
-                parsed_type = parse_type(column.type, relative_obj_data, len(relative_obj_data), version=self.version)
-            self.parsed_table[col_name].append(parsed_type)
 
 
     def _get_usage_map(self,page_num,row_num):
@@ -696,64 +513,55 @@ class AccessTable(object):
             memo_data = self._get_overflow_record(parsed_memo.record_pointer)
         else:
             LOGGER.debug("LVAL type 2")
-            if relative_obj_data == b':\x00:\x00:\x00.\x00.\x00.\x00': ###need to review process for LVAL type 2. sometimes works but this example has a record pointer greater than number of records on target page.
-                print('problem lval')
             rec_data = self._get_overflow_record(parsed_memo.record_pointer)
-            next_page = struct.unpack("I", rec_data[:4])[0]
-            # LVAL2 has data over multiple pages. The first 4 bytes of the page are the next record, then that data.
-            # Concat the data until we get a 0 next_page.
-            memo_data = b""
-            while next_page:
-                memo_data += rec_data[4:]
-                rec_data = self._get_overflow_record(next_page)
+            #adding a workaround until lval type 2 issue resolved.
+            if rec_data:
                 next_page = struct.unpack("I", rec_data[:4])[0]
-            memo_data += rec_data[4:]
+                # LVAL2 has data over multiple pages. The first 4 bytes of the page are the next record, then that data.
+                # Concat the data until we get a 0 next_page.
+                memo_data = b""
+                while next_page:
+                    memo_data += rec_data[4:]
+                    rec_data = self._get_overflow_record(next_page)
+                    next_page = struct.unpack("I", rec_data[:4])[0]
+                memo_data += rec_data[4:]
+            else:
+                memo_data = b""
         if memo_data:
             if return_raw:
                 return memo_data
             parsed_type = parse_type(memo_type, memo_data, len(memo_data), version=self.version)
             return parsed_type
 
-    def _get_overflow_record(self, record_pointer):
-        """
-        Get the actual record from a record pointer
-        :param record_pointer:
-        :return: record
-        """
-        record_offset = record_pointer & 0xff
-        page_num = record_pointer >> 8
-        record_page = self._all_pages.get(page_num * self.page_size)
-        if not record_page:
-            LOGGER.warning(f"Could not find overflow record data page overflow pointer: {record_pointer}")
-            return
-        parsed_data = parse_data_page_header(record_page, version=self.version)
-        if record_offset > len(parsed_data.record_offsets):
-            LOGGER.warning("Failed parsing overflow record offset")
-            return
-        start = parsed_data.record_offsets[record_offset]
-        if start & 0x8000:
-            start = start & 0xfff
-        else:
-            LOGGER.debug(f"Overflow record flag is not present {start}")
-        if record_offset == 0:
-            record = record_page[start:]
-        else:
-            end = parsed_data.record_offsets[record_offset - 1]
+    def _get_overflow_record(self, record_pointer: int):
+        slot_index = record_pointer & 0xFF
+        page_num   = record_pointer >> 8
+        page_data  = self._all_pages.get(page_num * self.page_size)
+        if page_data is None:
+            LOGGER.warning(f"Missing overflow page for pointer {record_pointer}")
+            return None
 
-            if end & 0x8000:# and (end & 0xff != 0): ##last byte check removed. stops valid end offsets from being parsed.
-                end = end & 0xfff
-            record = record_page[start: end]
-        return record
+        parsed_page = parse_data_page_header(page_data, version=self.version)
+        raw_loc     = parsed_page.record_offsets[slot_index]
 
+        # ─── SLICE OUT THE TRUE ROW ─────────────────────────────────────
+        start = self._clean_loc(raw_loc)
+        if slot_index == 0:
+            end = self.page_size
+        else:
+            end = self._clean_loc(parsed_page.record_offsets[slot_index - 1])
+
+        return page_data[start:end]
 
 
     # starting point for a iterating parser to enable outputs to be streamed to avoid memory overflows.
-    def _new_parse_row(self, record):
+    def _parse_row(self, record):
         """
         Reads the row data from the given row buffer.  Leaves limit unchanged.
         :param record: the current row data
         :return:
         """
+
         original_record = record
 
         # Records contain null bitmaps for columns. The number of bitmaps is the number of columns / 8 rounded up
@@ -761,10 +569,11 @@ class AccessTable(object):
         if null_table_len and null_table_len < len(original_record):
             null_table = record[-null_table_len:]
             # Turn bitmap to a list of True False values
-            null_table = [((null_table[i // 8]) & (1 << (i % 8))) != 0 for i in range(len(null_table) * 8)]
+            null_table = [((null_table[i // 8]) & (1 << (i % 8))) == 0 for i in range(len(null_table) * 8)]
         else:
             LOGGER.error(f"Failed to parse null table column count {self.table_header.column_count}")
             return
+
 
         if self.version.SIZE_ROW_VAR_COL_OFFSET != 2:
 
@@ -815,7 +624,7 @@ class AccessTable(object):
                     varColumnsOffsetPos = (len(original_record) - null_table_len - 4) - (column.variable_column_number * 2)
 
                     varDataStart = parse_buffer_custom(original_record,varColumnsOffsetPos,'Int16ul')
-                    varDataEnd = parse_buffer_custom(original_record,varColumnsOffsetPos,'Int16ul')
+                    varDataEnd = parse_buffer_custom(original_record,varColumnsOffsetPos-2,'Int16ul')
                 
                 else:
 
@@ -842,7 +651,7 @@ class AccessTable(object):
                 value = numeric_to_string(data, scale)
             else:
                 # fallback to gerneral parse_type
-                value = parse_type(colDataType, data, version=self.version, props=column.extra_props or None)
+                value = parse_type(colDataType, data, colDataLen, version=self.version, props=column.extra_props or None)
 
             self.parsed_table[column_name].append(value)
 
