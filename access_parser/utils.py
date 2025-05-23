@@ -4,8 +4,6 @@ import struct
 import uuid
 import math
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import List
 
 LOGGER = logging.getLogger("access_parser.utils")
 

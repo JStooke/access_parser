@@ -11,18 +11,6 @@ from .utils import categorize_pages, parse_type, TYPE_MEMO, TYPE_TEXT, TYPE_BOOL
     TYPE_96_BIT_17_BYTES, TYPE_OLE
 from .jetformat import BaseFormat, Jet3Format, PageTypes
 
-# Page sizes
-PAGE_SIZE_V3 = 0x800
-PAGE_SIZE_V4 = 0x1000
-
-# Versions
-VERSION_3 = 0x00
-VERSION_4 = 0x01
-VERSION_5 = 0x02
-VERSION_2010 = 0x03
-
-ALL_VERSIONS = {VERSION_3: 3, VERSION_4: 4, VERSION_5: 5, VERSION_2010: 2010}
-NEW_VERSIONS = [VERSION_4, VERSION_5, VERSION_2010]
 
 SYSTEM_TABLE_FLAGS = [-0x80000000, -0x00000002, 0x80000000, 0x00000002]
 
@@ -647,7 +635,7 @@ class AccessTable(object):
             if colDataType in (TYPE_MEMO,TYPE_OLE):
                 value = self._parse_memo(data, return_raw=(colDataType == TYPE_OLE))
             elif colDataType == TYPE_96_BIT_17_BYTES:
-                scale = column.extra_props.get("scale", 6)
+                scale = column.extra_props.get("scale", column.various.get("scale",6))
                 value = numeric_to_string(data, scale)
             else:
                 # fallback to gerneral parse_type
