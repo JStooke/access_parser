@@ -217,9 +217,9 @@ class AccessTable(object):
     def _clean_loc(self, x: int) -> int:
         """
         Strip off the high-bit flags (0x8000 = deleted, 0x4000 = overflow)
-        to get the true 12-bit page offset.
+        to get the true 13-bit page offset.
         """
-        return x & 0x0FFF
+        return x & 0x1FFF
 
 
     def parse(self):
