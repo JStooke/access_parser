@@ -28,8 +28,8 @@ class TableObj(object):
         self.value = val
         self.offset = offset
         self.linked_pages = []
-        self.owned_pages = []
-        self.free_space_pages = []
+        self.owned_pages = {}
+        self.free_space_pages = {}
 
 
 class AccessParser(object):
@@ -230,7 +230,7 @@ class AccessTable(object):
         if not self.table.owned_pages:
             return self.create_empty_table()
 
-        for page_data in self.table.owned_pages:
+        for page_num, page_data in self.table.owned_pages.items():
             parsed_page = parse_data_page_header(page_data, version=self.version)
             # iterate each slot entry
             for row_num, raw_loc in enumerate(parsed_page.record_offsets):
@@ -412,10 +412,10 @@ class AccessTable(object):
             #add usage maps from table referenced by table head
             #The catalog level linked pages array can be out of date following deletes. so use table header info to find accurate usage maps.
             owned_pages_map = self._get_usage_map(table_header.row_page_map_page_number,table_header.row_page_map_row_number)
-            self.table.owned_pages = [self._all_pages[pn * self.page_size] for pn in owned_pages_map]
+            self.table.owned_pages = {pn: self._all_pages[pn * self.page_size] for pn in owned_pages_map}
 
             free_space_pages_map = self._get_usage_map(table_header.free_space_page_map_page_number,table_header.free_space_page_map_row_number)
-            self.table.free_space_pages = [self._all_pages[pn * self.page_size] for pn in free_space_pages_map]
+            self.table.free_space_pages = {pn: self._all_pages[pn * self.page_size] for pn in free_space_pages_map}
 
 
             # Merge Data back to table_header
